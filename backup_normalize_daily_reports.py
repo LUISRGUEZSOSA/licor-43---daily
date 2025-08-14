@@ -6,6 +6,7 @@ import numpy as np
 import datetime as _dt
 import math
 
+
 # -------------------- Helpers ----------------------------
 DATE_RE = re.compile(r"^\s*(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\s*$", re.I)
 
@@ -20,11 +21,6 @@ SECTION_SYNONYMS = {
     "INTERNO":"EMPLOYEES","EMPLEADOS":"EMPLOYEES","Empleados":"EMPLOYEES",
 }
 
-# Etiquetas que aparecen como banderas en la hoja pero no son métricas
-NON_METRIC_LABELS = {"TRUE","FALSE"}
-
-ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$")
-
 def is_date_like(x):
     """True si x parece una fecha: Timestamp, date/datetime o string parseable (DD/MM/YY admite dayfirst)."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -35,23 +31,27 @@ def is_date_like(x):
     if not s:
         return False
     d = pd.to_datetime(s, dayfirst=True, errors="coerce")
-    return pd.notna(d) and (1900 <= d.year <= 2100)
+    return pd.notna(d) and (1900 <= d.year <= 2100)  # evita falsos positivos
+
+ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$")
 
 def parse_date(s):
     s = str(s).strip()
     if not s:
         return pd.NaT
-    if ISO_RE.match(s):  # YYYY-MM-DD [+ hh:mm:ss]
+    # Si es ISO (YYYY-MM-DD [HH:MM:SS]) no uses dayfirst
+    if ISO_RE.match(s):
         return pd.to_datetime(s, errors="coerce")
+    # Resto: formato europeo
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
+
 
 def parse_number(x):
     """
     Devuelve (valor: float|None, is_percent: bool).
-
-    - Acepta tipos numéricos ya parseados por pandas/openpyxl.
-    - Acepta strings con decimal coma/punto y notación científica (p.ej. '1.47e-4').
-    - Si el string acaba en '%', divide entre 100 (ej. '139%' -> 1.39) y marca is_percent=True.
+    - No elimina puntos/decimales.
+    - Acepta notación científica (p.ej. 1.47e-4).
+    - Si el string acaba en '%', divide entre 100 y marca is_percent=True.
     - Si no es numérico, devuelve (None, False).
     """
     if x is None:
@@ -59,6 +59,7 @@ def parse_number(x):
     if isinstance(x, float) and math.isnan(x):
         return None, False
     if isinstance(x, (int, float)):
+        # Ya viene numérico de pandas/openpyxl
         return float(x), False
 
     s = str(x).strip()
@@ -69,16 +70,18 @@ def parse_number(x):
     if is_pct:
         s = s[:-1].strip()
 
-    # Normaliza: quita espacios/nbsp y cambia coma decimal por punto (no elimines puntos)
+    # Normaliza espacios y decimal coma → punto. ¡No quites puntos!
     s = s.replace("\u00A0", "").replace(" ", "").replace(",", ".")
 
     try:
-        val = float(s)  # Python acepta notación científica '1e-6', '3.4E+5', etc.
+        val = float(s)  # Python acepta 1e-6, 3.4E+5, etc.
+        # (notación científica soportada por el lenguaje). 
+        # https://docs.python.org/3/reference/lexical_analysis.html#floating-point-literals
     except ValueError:
         return None, is_pct
 
     if is_pct:
-        val /= 100.0  # 139% -> 1.39
+        val /= 100.0  # Excel muestra 139%, el valor base es 1.39 → guardamos 0.0139 si el texto traía '%'
     return val, is_pct
 
 def find_date_header_row(df):
@@ -108,9 +111,9 @@ def normalize_file(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
     if path.suffix.lower() in [".xlsx", ".xlsm", ".xls"]:
         df = pd.read_excel(
             path,
-            sheet_name=sheet_name,
+            sheet_name=sheet_name,  # hoja "Daily"
             header=None,
-            dtype=object,          # preserva tipos crudos de cada celda
+            dtype=object,          # preserva tipos crudos
             engine="openpyxl",
         )
     elif path.suffix.lower() == ".csv":
@@ -143,16 +146,18 @@ def normalize_file(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
             if isinstance(v, str) and v.strip() != "":
                 label = str(v).strip()
 
-        # Determina sección / métrica
-        metric_label = None
+        # Actualiza sección si corresponde (y normaliza nombre)
         if label:
             up = label.upper()
             if up in SECTION_SYNONYMS:
                 current_section = SECTION_SYNONYMS[up]
-            elif up in NON_METRIC_LABELS:
-                metric_label = None  # ignora TRUE/FALSE como métrica
-            else:
-                metric_label = label  # p.ej., COMIDA, BEBIDA, Factura, etc.
+                # Esta fila suele ser título de sección; puede que no tenga datos
+                # Continuamos a mapear valores igualmente por si acaso.
+
+        metric_label = None
+        # Si label NO es una sección conocida, trátalo como métrica (COMIDA, BEBIDA, TRUE/FALSE, etc.)
+        if label and (label.upper() not in SECTION_SYNONYMS):
+            metric_label = label
 
         # Emite celdas diarias
         for c, d in col2date.items():
@@ -162,14 +167,11 @@ def normalize_file(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
             s = str(v).strip()
             if s == "":
                 continue
+            v = row.iloc[c]
             if is_date_like(v):
-                continue  # evita filas con fechas en el cuerpo
+                continue  # <- evita filas-basura con "2025-01-xx 00:00:00"
 
             val_num, is_pct = parse_number(s)
-            if val_num is None:
-                # ignora textos tipo "Online", "Walkin", "Teléfono", etc.
-                continue
-
             records.append({
                 "source_file": path.name,
                 "section": current_section,
@@ -187,17 +189,16 @@ def normalize_file(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
             if tv is not None and not (isinstance(tv, float) and np.isnan(tv)) and str(tv).strip() != "":
                 s = str(tv).strip()
                 val_num, is_pct = parse_number(s)
-                if val_num is not None:
-                    records.append({
-                        "source_file": path.name,
-                        "section": current_section,
-                        "metric_label": metric_label,
-                        "date": pd.NaT,       # totales sin fecha
-                        "value_raw": s,
-                        "value_num": val_num,
-                        "is_percent": is_pct,
-                        "is_total": True,
-                    })
+                records.append({
+                    "source_file": path.name,
+                    "section": current_section,
+                    "metric_label": metric_label,
+                    "date": pd.NaT,       # totales sin fecha
+                    "value_raw": s,
+                    "value_num": val_num,
+                    "is_percent": is_pct,
+                    "is_total": True,
+                })
 
     out = pd.DataFrame.from_records(records)
     # Ordena columnas y devuelve
@@ -217,6 +218,7 @@ def main():
     for f in args.files:
         df = normalize_file(Path(f), sheet_name=args.sheet)
         if args.peek:
+            # guarda vista previa por archivo
             prev = df.head(30)
             prev.to_csv(f"_peek_{Path(f).stem}.csv", index=False)
         frames.append(df)
@@ -225,7 +227,6 @@ def main():
     cols = ["source_file","section","metric_label","date","value_raw","value_num","is_percent","is_total"]
     master = master.reindex(columns=cols)
     master.to_csv(args.out, index=False)
-
     by_file = master.groupby("source_file")["value_raw"].count().to_dict() if not master.empty else {}
     print("OK. Filas por archivo:", by_file)
     print("Salida:", args.out)
