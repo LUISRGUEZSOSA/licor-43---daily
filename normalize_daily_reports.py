@@ -10,7 +10,7 @@ Salida (columnas):
   - sheet: hoja usada (Daily si existe; si no, la primera)
   - section: sección canónica (RESTAURANT, BAR, etc.)
   - metric_label: etiqueta de métrica (texto de fila a la izquierda de las fechas)
-  - date: fecha ISO (YYYY-MM-DD) detectada en la cabecera de columnas
+  - date: fecha ISO (YYYY-MM-DD) detectada en la cabecera de columnas (forzada al último día del mes)
   - value_raw: texto original de la celda
   - value_num: valor numérico (float), con % escalado a [0..1]
   - is_percent: True si provenía de '%'
@@ -28,7 +28,7 @@ Dependencias:
 """
 import argparse, re, sys, math, unicodedata
 from pathlib import Path
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
@@ -54,6 +54,57 @@ ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$")
 TOTAL_TOKENS = {"TOTAL","TOTAL "}
 
 LABEL_KEYS = {"MES","INICIO DAILY","DIA","DIAS MES","DIA DAILY"}
+
+# --- utilidades para meses (ES/EN y abreviaturas) ---
+MONTHS = {
+    # español
+    "enero":1,"ene":1, "febrero":2,"feb":2, "marzo":3,"mar":3,
+    "abril":4,"abr":4, "mayo":5,"may":5, "junio":6,"jun":6,
+    "julio":7,"jul":7, "agosto":8,"ago":8, "septiembre":9,"sep":9,"setiembre":9,"set":9,
+    "octubre":10,"oct":10, "noviembre":11,"nov":11, "diciembre":12,"dic":12,
+    # inglés
+    "january":1,"jan":1,"february":2,"feb":2,"march":3,"mar":3,
+    "april":4,"apr":4,"may":5,"june":6,"jun":6,"july":7,"jul":7,
+    "august":8,"aug":8,"september":9,"sep":9,"october":10,"oct":10,
+    "november":11,"nov":11,"december":12,"dec":12,
+}
+
+YEAR_ONLY_RE = re.compile(r"^\s*(19|20)\d{2}\s*$")
+
+def month_from_name(s: Any):
+    if s is None:
+        return None
+    key = str(s)
+    # normaliza: quita NBSP, dos puntos, puntos, tildes y dobles espacios
+    key = key.replace("\u00A0", " ")
+    key = key.replace(":", " ").replace(".", " ")
+    key = key.strip().lower()
+    key = ''.join(c for c in unicodedata.normalize('NFD', key) if unicodedata.category(c) != 'Mn')
+    key = re.sub(r"\s+", " ", key)
+    return MONTHS.get(key)
+
+def file_month_from_filename(name: str) -> int | None:
+    """Detecta mes en el nombre de archivo por texto (ene/feb/...) o número (1..12 o 01..12)."""
+    s = name.lower()
+    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    s = s.replace(".xlsx","").replace(".xls","").replace(".csv","")
+    s = s.replace("-", " ").replace("_", " ").replace(".", " ")
+    tokens = re.split(r"\s+", s)
+    # 1) textual
+    for t in tokens:
+        m = MONTHS.get(t)
+        if m: return m
+    # 2) número de mes
+    for t in tokens:
+        if t.isdigit():
+            n = int(t)
+            if 1 <= n <= 12:
+                return n
+    return None
+
+def last_day(year: int, month: int) -> pd.Timestamp:
+    start = pd.Timestamp(year=year, month=month, day=1)
+    return (start + pd.offsets.MonthBegin(1) - pd.offsets.Day(1))
 
 # -------------------- Helpers ----------------------------
 def strip_accents(s: str) -> str:
@@ -89,6 +140,10 @@ def is_date_like(x) -> bool:
     except Exception:
         return False
 
+def is_month_or_date_cell(x) -> bool:
+    """True si la celda es una fecha parseable o un nombre de mes."""
+    return is_date_like(x) or (month_from_name(x) is not None)
+
 def parse_date(s):
     if s is None:
         return pd.NaT
@@ -106,7 +161,6 @@ def parse_date(s):
     if pd.isna(d):
         return pd.NaT
     return pd.to_datetime(d).normalize()
-
 
 def parse_number(x) -> Tuple[Any, bool]:
     """Devuelve (valor_float|None, is_percent). Escala '%' a [0..1]. Acepta coma decimal y notación científica."""
@@ -126,8 +180,7 @@ def parse_number(x) -> Tuple[Any, bool]:
         s = s[:-1].strip()
 
     s = s.replace("\u00A0","").replace(" ","").replace("€","").replace("$","").replace("£","")
-    # Cambia coma decimal por punto (no elimines los puntos porque pueden ser decimales)
-    s = s.replace(",", ".")
+    s = s.replace(",", ".")  # coma decimal -> punto
 
     try:
         val = float(s)
@@ -150,12 +203,12 @@ def expand_merged(ws, grid):
 
 def find_date_header_row(grid) -> Tuple[int,int,int,int]:
     """
-    Busca la fila con más 'celdas-fecha'. Devuelve (row_idx, first_col, last_col, total_col).
+    Busca la fila con más 'celdas-fecha/mes'. Devuelve (row_idx, first_col, last_col, total_col).
     - total_col: índice de columna que contenga "TOTAL" (a la derecha de fechas), o -1 si no hay.
     """
     best = (-1,-1,-1,-1)
     for r, row in enumerate(grid):
-        date_cols = [c for c, v in enumerate(row) if is_date_like(v)]
+        date_cols = [c for c, v in enumerate(row) if is_month_or_date_cell(v)]
         if len(date_cols) >= 3:
             first_c, last_c = min(date_cols), max(date_cols)
             total_c = -1
@@ -168,7 +221,6 @@ def find_date_header_row(grid) -> Tuple[int,int,int,int]:
     return best
 
 def nearest_left(grid, r, c, max_depth=3) -> Tuple[str,str]:
-    """Devuelve (primera_izquierda, pila_izquierda separada por '|')."""
     vals = []
     cc = c-1
     while cc >= 0 and len(vals) < max_depth:
@@ -179,7 +231,6 @@ def nearest_left(grid, r, c, max_depth=3) -> Tuple[str,str]:
     return (vals[0] if vals else "", "|".join(vals))
 
 def nearest_top(grid, r, c, max_depth=5) -> Tuple[str,str]:
-    """Devuelve (primera_superior, pila_superior separada por '|')."""
     vals = []
     rr = r-1
     while rr >= 0 and len(vals) < max_depth:
@@ -206,28 +257,47 @@ def detect_meta(grid) -> Dict[str, Any]:
         meta["DIA DAILY"] = str(d.date()) if pd.notna(d) else meta["DIA DAILY"]
     return meta
 
-
-def infer_month_last_day(source_file: str, meta: dict, col2date: dict):
-    """Infer the month to which this sheet belongs, then return its last day (datetime.date)."""
-    # 1) meta_inicio_daily (YYYY-MM-DD) -> month
-    for k in list(meta.keys()):
-        # meta keys are uppercase like 'INICIO DAILY', see detection code; normalize value to string
-        pass
-    # Prefer explicit start-of-month meta
-    start_s = None
-    for k in ["INICIO DAILY", "DIA DAILY", "MES"]:
-        if f"meta_{k.replace(' ','_').lower()}" in meta:
-            start_s = meta[f"meta_{k.replace(' ','_').lower()}"]
-            break
+def infer_month_last_day(source_file: str, meta_prefixed: dict, col2date: dict, file_month: int | None):
+    """Devuelve el último día del mes referente del archivo (date)."""
     month_ref = None
-    if start_s:
-        try:
+
+    # 0) Si el nombre del archivo tiene mes textual/numérico, úsalo directamente con un año razonable.
+    if file_month:
+        # año: intenta meta primero
+        start_s = None
+        for k in ["INICIO DAILY", "DIA DAILY", "MES"]:
+            k2 = f"meta_{k.replace(' ','_').lower()}"
+            if k2 in meta_prefixed:
+                start_s = meta_prefixed[k2]
+                break
+        base_year = None
+        if start_s:
             dt = pd.to_datetime(start_s, errors="coerce")
             if pd.notna(dt):
-                month_ref = pd.Timestamp(year=dt.year, month=dt.month, day=1)
-        except Exception:
-            month_ref = None
-    # 2) filename pattern YYYYMM
+                base_year = int(dt.year)
+        if base_year is None:
+            m = re.search(r"(\d{4})", source_file)
+            if m:
+                base_year = int(m.group(1))
+        if base_year is None:
+            # último recurso: mayor año visible en col2date
+            years = [pd.to_datetime(v).year for v in col2date.values()] if col2date else []
+            base_year = max(years) if years else pd.Timestamp.today().year
+        return (last_day(base_year, file_month)).date()
+
+    # 1) meta explícita
+    start_s = None
+    for k in ["INICIO DAILY", "DIA DAILY", "MES"]:
+        k2 = f"meta_{k.replace(' ','_').lower()}"
+        if k2 in meta_prefixed:
+            start_s = meta_prefixed[k2]
+            break
+    if start_s:
+        dt = pd.to_datetime(start_s, errors="coerce")
+        if pd.notna(dt):
+            month_ref = pd.Timestamp(year=dt.year, month=dt.month, day=1)
+
+    # 2) filename YYYYMM
     if month_ref is None:
         m = re.search(r"(\d{4})(\d{2})", source_file)
         if m:
@@ -236,20 +306,20 @@ def infer_month_last_day(source_file: str, meta: dict, col2date: dict):
                 month_ref = pd.Timestamp(year=y, month=mth, day=1)
             except Exception:
                 month_ref = None
-    # 3) fallback: max date in header
+
+    # 3) fallback: max fecha en col2date
     if month_ref is None and col2date:
         try:
             mx = max([pd.to_datetime(v) for v in col2date.values() if pd.notna(v)])
             month_ref = pd.Timestamp(year=mx.year, month=mx.month, day=1)
         except Exception:
             month_ref = None
+
     if month_ref is None:
-        # final fallback: today month
         month_ref = pd.Timestamp.today().normalize().replace(day=1)
-    # last day
+
     next_month = (month_ref + pd.offsets.MonthBegin(1))
-    last_day = (next_month - pd.offsets.Day(1)).date()
-    return last_day
+    return (next_month - pd.offsets.Day(1)).date()
 
 def normalize_one(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
     wb = load_workbook(path, data_only=True)
@@ -259,24 +329,62 @@ def normalize_one(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
     grid = [[ws.cell(row=r, column=c).value for c in range(1, max_col+1)] for r in range(1, max_row+1)]
     grid = expand_merged(ws, grid)
 
-    # detectar cabecera de fechas
+    # detectar cabecera de fechas/meses
     hdr_row, first_c, last_c, total_c = find_date_header_row(grid)
     if hdr_row < 0:
-        raise RuntimeError(f"No encontré fila de fechas en {path.name} (sheet {sheet})")
+        raise RuntimeError(f"No encontré fila de fechas/meses en {path.name} (sheet {sheet})")
 
-    # mapa col->fecha
+    # meta antes de mapear fechas
+    meta = detect_meta(grid)
+
+    # Año base (para construir fechas cuando solo sabemos el mes)
+    base_year = None
+    for k in ("INICIO DAILY", "DIA DAILY"):
+        if k in meta:
+            d0 = pd.to_datetime(meta[k], errors="coerce", dayfirst=True)
+            if pd.notna(d0):
+                base_year = int(d0.year)
+                break
+    if base_year is None:
+        m = re.search(r"(\d{4})", path.name)
+        if m:
+            base_year = int(m.group(1))
+    if base_year is None:
+        base_year = pd.Timestamp.today().year
+
+    # Mes deducido del nombre de archivo (p.ej. "02_febrero.xlsx", "03 marzo.xlsx")
+    file_month = file_month_from_filename(path.name)
+
+    # mapa col->fecha (forzando último día del mes)
     col2date: Dict[int, pd.Timestamp] = {}
     for c in range(first_c, last_c+1):
-        d = parse_date(grid[hdr_row][c])
+        cell = grid[hdr_row][c]
+        sraw = "" if cell is None else str(cell).strip()
+        d = parse_date(cell)  # intento parseo estándar (fechas tipo 01/02/2025)
+
+        if sraw and YEAR_ONLY_RE.match(sraw):
+            # header es solo "2025" o "2024" → usa ese año + MES DEL ARCHIVO
+            y = int(sraw)
+            mnum = file_month if file_month else pd.Timestamp.today().month
+            d = last_day(y, mnum)
+
+        elif pd.isna(d):
+            mnum = month_from_name(cell)  # p.ej. "febrero" -> 2
+            if mnum:
+                d = last_day(base_year, mnum)
+            elif file_month:
+                # fallback: usa el mes del archivo si la celda no da fecha ni mes
+                d = last_day(base_year, file_month)
+        else:
+            # ya hay fecha -> llevarla al último día de su mes
+            d = last_day(d.year, d.month)
+
         if pd.notna(d):
             col2date[c] = d
 
-    meta = detect_meta(grid)
-
-    # compute last day of month for this file
-    meta_prefixed = {f"meta_{k.replace(' ','_').lower()}": v for k,v in meta.items()}
-    last_day_for_file = infer_month_last_day(path.name, meta_prefixed, col2date)
-
+    # compute last day de referencia para 'scenario'
+    meta_prefixed = {f"meta_{k.replace(' ','_').lower()}": v for k, v in meta.items()}
+    last_day_for_file = infer_month_last_day(path.name, meta_prefixed, col2date, file_month)
 
     current_section = None
     rows = []
@@ -296,7 +404,6 @@ def normalize_one(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
         metric_label = None
         if label:
             up = canon_upper(label)
-            # mapear a sección canónica
             if up in SECTION_SYNONYMS:
                 current_section = SECTION_SYNONYMS[up]
             elif up in NON_METRIC_LABELS:
@@ -310,7 +417,7 @@ def normalize_one(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
             if v is None:
                 continue
             s = canon(v)
-            if s == "" or is_date_like(v):
+            if s == "" or is_month_or_date_cell(v):  # evitar re-leer encabezados
                 continue
             val_num, is_pct = parse_number(s)
             if val_num is None:
@@ -331,12 +438,11 @@ def normalize_one(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
                 "is_percent": is_pct,
                 "is_total": False,
                 "scenario": scen,
-                "scenario": None,
                 "context_left": left1,
                 "context_top": top1,
                 "context_left_stack": left_stack,
                 "context_top_stack": top_stack,
-                **{f"meta_{k.replace(' ','_').lower()}": v for k,v in meta.items()},
+                **{f"meta_{k.replace(' ','_').lower()}": v for k, v in meta.items()},
             })
 
         # TOTAL si existe
@@ -364,7 +470,7 @@ def normalize_one(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
                             "context_top": top1,
                             "context_left_stack": left_stack,
                             "context_top_stack": top_stack,
-                            **{f"meta_{k.replace(' ','_').lower()}": v for k,v in meta.items()},
+                            **{f"meta_{k.replace(' ','_').lower()}": v for k, v in meta.items()},
                         })
 
     out = pd.DataFrame.from_records(rows)
@@ -412,6 +518,4 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
-
     sys.exit(main())

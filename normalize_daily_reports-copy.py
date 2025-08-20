@@ -34,6 +34,47 @@ import pandas as pd
 from openpyxl import load_workbook
 from datetime import datetime
 
+    # --- utilidades locales para meses ---
+MONTHS = {
+    # español
+    "enero":1,"ene":1, "febrero":2,"feb":2, "marzo":3,"mar":3,
+    "abril":4,"abr":4, "mayo":5,"may":5, "junio":6,"jun":6,
+    "julio":7,"jul":7, "agosto":8,"ago":8, "septiembre":9,"sep":9,"setiembre":9,"set":9,
+    "octubre":10,"oct":10, "noviembre":11,"nov":11, "diciembre":12,"dic":12,
+    # inglés (por si acaso)
+    "january":1,"jan":1,"february":2,"feb":2,"march":3,"mar":3,
+    "april":4,"apr":4,"may":5,"june":6,"jun":6,"july":7,"jul":7,
+    "august":8,"aug":8,"september":9,"sep":9,"october":10,"oct":10,
+    "november":11,"nov":11,"december":12,"dec":12,
+}
+
+def month_from_name(s: str):
+    if s is None: return None
+    key = str(s).strip().lower()
+    # elimina tildes por seguridad
+    import unicodedata, re
+    key = ''.join(c for c in unicodedata.normalize('NFD', key) if unicodedata.category(c) != 'Mn')
+    key = re.sub(r"\s+", " ", key)
+    return MONTHS.get(key)
+
+# Año base: intenta INICIO DAILY o DIA DAILY; si no, año en filename; si no, año actual
+base_year = None
+for k in ("INICIO DAILY", "DIA DAILY"):
+    if k in meta:
+        d0 = pd.to_datetime(meta[k], errors="coerce", dayfirst=True)
+        if pd.notna(d0):
+            base_year = int(d0.year); break
+if base_year is None:
+    m = re.search(r"(\d{4})", path.name)
+    if m:
+        base_year = int(m.group(1))
+if base_year is None:
+    base_year = pd.Timestamp.today().year
+
+def last_day(year: int, month: int) -> pd.Timestamp:
+    start = pd.Timestamp(year=year, month=month, day=1)
+    return (start + pd.offsets.MonthBegin(1) - pd.offsets.Day(1))
+
 # -------------------- Config ----------------------------
 SECTION_SYNONYMS = {
     "RESTAURANTE":"RESTAURANT", "RESTAURANT":"RESTAURANT",
@@ -263,15 +304,26 @@ def normalize_one(path: Path, sheet_name: str = "Daily") -> pd.DataFrame:
     hdr_row, first_c, last_c, total_c = find_date_header_row(grid)
     if hdr_row < 0:
         raise RuntimeError(f"No encontré fila de fechas en {path.name} (sheet {sheet})")
+    
+    meta = detect_meta(grid)
 
     # mapa col->fecha
     col2date: Dict[int, pd.Timestamp] = {}
+    col2date: Dict[int, pd.Timestamp] = {}
     for c in range(first_c, last_c+1):
-        d = parse_date(grid[hdr_row][c])
+        cell = grid[hdr_row][c]
+        d = parse_date(cell)  # intentamos parseo estándar
+        if pd.isna(d):
+            mnum = month_from_name(cell)  # p.ej. "febrero" -> 2
+            if mnum:
+                d = last_day(base_year, mnum)
+        else:
+            # ya hay fecha -> llevarla al último día de su mes
+            d = last_day(d.year, d.month)
+
         if pd.notna(d):
             col2date[c] = d
 
-    meta = detect_meta(grid)
 
     # compute last day of month for this file
     meta_prefixed = {f"meta_{k.replace(' ','_').lower()}": v for k,v in meta.items()}
